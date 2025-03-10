@@ -1,0 +1,35 @@
+graph TD
+    subgraph "User Interface"
+        Landing["Landing Page"]
+        Categories["Category Explorer"]
+        Details["Model Details View"]
+        Demo["Interactive Demo"]
+    end
+
+    subgraph "Navigation Flow"
+        Landing --> Categories
+        Categories --> Details
+        Details --> Demo
+    end
+
+    subgraph "Data Organization"
+        ModelsConfig["models.json - Metadata"]
+        CategoryFilters["Category Definitions"]
+        DemoFrames["iFrame Integration"]
+        ModelAssets["Model Assets & Thumbnails"]
+    end
+
+    ModelsConfig --> Categories
+    ModelsConfig --> Details
+    CategoryFilters --> Categories
+    DemoFrames --> Demo
+    ModelAssets --> Details
+
+    subgraph "Deployment"
+        HFSpace["Hugging Face Space"]
+        StaticSite["Static Site Generator"]
+        ModelHub["Existing Model Demos"]
+    end
+
+    StaticSite --> HFSpace
+    ModelHub --> DemoFrames

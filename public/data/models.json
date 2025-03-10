@@ -1,0 +1,204 @@
+{
+  "models": [
+    {
+      "id": "phi-3.5-webgpu",
+      "name": "Phi 3.5 WebGPU",
+      "description": "Microsoft's compact yet powerful language model running in WebGPU",
+      "longDescription": "A simple React + Vite application for running Phi-3.5-mini-instruct, a powerful small language model, locally in the browser using Transformers.js and WebGPU-acceleration. This model delivers impressive chat capabilities while maintaining efficiency for client-side deployment.",
+      "category": "llm",
+      "subcategory": "chat",
+      "valueRanking": 9,
+      "valueLabel": "Very High",
+      "modelName": "Phi-3.5-mini-instruct",
+      "modelSize": "2.7B parameters", 
+      "thumbnailUrl": "/images/models/phi-3.5.png",
+      "screenshotUrls": [
+        "/images/screenshots/phi-3.5-1.png",
+        "/images/screenshots/phi-3.5-2.png"
+      ],
+      "demoUrl": "https://huggingface.co/spaces/webml-community/phi-3.5-webgpu",
+      "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/phi-3.5-webgpu",
+      "tags": ["language-model", "chat", "webgpu", "microsoft"],
+      "features": ["Conversational", "Instruction-tuned", "WebGPU-accelerated"],
+      "performance": {
+        "loadTime": "~15 seconds",
+        "memoryUsage": "~1.5GB",
+        "browserSupport": ["Chrome", "Edge", "Safari TP"]
+      },
+      "relatedModels": ["llama-3.2-webgpu", "deepseek-r1-webgpu", "smollm-webgpu"]
+    },
+    {
+      "id": "llama-3.2-webgpu",
+      "name": "Llama 3.2 WebGPU",
+      "description": "State-of-the-art language model running in browser with WebGPU acceleration",
+      "longDescription": "Experience Meta's Llama 3.2, a powerful open-source language model running entirely in your browser using WebGPU acceleration. This demo showcases how sophisticated AI models can run client-side with excellent performance and no server requirements.",
+      "category": "llm",
+      "subcategory": "chat",
+      "valueRanking": 9,
+      "valueLabel": "Very High",
+      "modelName": "Llama 3.2 8B",
+      "modelSize": "8B parameters",
+      "thumbnailUrl": "/images/models/llama-3.2.png",
+      "screenshotUrls": [
+        "/images/screenshots/llama-3.2-1.png",
+        "/images/screenshots/llama-3.2-2.png"
+      ],
+      "demoUrl": "https://huggingface.co/spaces/webml-community/llama-3.2-webgpu",
+      "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/llama-3.2-webgpu",
+      "tags": ["language-model", "chat", "webgpu", "meta"],
+      "features": ["Conversational", "Instruction-tuned", "WebGPU-accelerated"],
+      "performance": {
+        "loadTime": "~20 seconds",
+        "memoryUsage": "~2.0GB",
+        "browserSupport": ["Chrome", "Edge", "Safari TP"]
+      },
+      "relatedModels": ["phi-3.5-webgpu", "llama-3.2-reasoning-webgpu", "smollm-webgpu"]
+    },
+    {
+      "id": "realtime-whisper-webgpu",
+      "name": "Realtime Whisper WebGPU",
+      "description": "Real-time speech recognition with WebGPU acceleration",
+      "longDescription": "This demo showcases OpenAI's Whisper model running in real-time directly in your browser using WebGPU acceleration. It can transcribe speech from your microphone or uploaded audio files with impressive accuracy and supports multiple languages.",
+      "category": "speech",
+      "subcategory": "recognition",
+      "valueRanking": 9,
+      "valueLabel": "Very High",
+      "modelName": "Whisper Tiny.en",
+      "modelSize": "39M parameters",
+      "thumbnailUrl": "/images/models/whisper-realtime.png",
+      "screenshotUrls": [
+        "/images/screenshots/whisper-realtime-1.png",
+        "/images/screenshots/whisper-realtime-2.png"
+      ],
+      "demoUrl": "https://huggingface.co/spaces/webml-community/realtime-whisper-webgpu",
+      "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/realtime-whisper-webgpu",
+      "tags": ["speech-recognition", "audio", "webgpu", "openai"],
+      "features": ["Real-time", "Multi-language", "Microphone input", "WebGPU-accelerated"],
+      "performance": {
+        "loadTime": "~5 seconds",
+        "memoryUsage": "~250MB",
+        "browserSupport": ["Chrome", "Edge", "Safari TP"]
+      },
+      "relatedModels": ["whisper-word-timestamps", "speecht5-web", "text-to-speech-webgpu"]
+    },
+    {
+      "id": "depth-anything",
+      "name": "Depth Anything",
+      "description": "Monocular depth estimation from images to create depth maps",
+      "longDescription": "Depth Anything is a powerful computer vision model that estimates depth from a single image. This demo allows you to upload any image and get a detailed depth map showing the relative distances of objects in the scene, all running locally in your browser.",
+      "category": "computer-vision",
+      "subcategory": "depth-estimation",
+      "valueRanking": 8,
+      "valueLabel": "High",
+      "modelName": "Depth Anything",
+      "modelSize": "~20M parameters",
+      "thumbnailUrl": "/images/models/depth-anything.png",
+      "screenshotUrls": [
+        "/images/screenshots/depth-anything-1.png",
+        "/images/screenshots/depth-anything-2.png"
+      ],
+      "demoUrl": "https://huggingface.co/spaces/webml-community/depth-anything",
+      "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/depth-anything",
+      "tags": ["computer-vision", "depth-estimation", "image-processing"],
+      "features": ["Image upload", "Depth visualization", "Color mapping"],
+      "performance": {
+        "loadTime": "~5 seconds",
+        "memoryUsage": "~300MB",
+        "browserSupport": ["Chrome", "Firefox", "Safari"]
+      },
+      "relatedModels": ["depth-estimation-video", "remove-background-webgpu", "video-background-removal"]
+    },
+    {
+      "id": "adaptive-retrieval",
+      "name": "Adaptive Retrieval",
+      "description": "Matryoshka embedding system for adaptive document retrieval with adjustable dimensions",
+      "longDescription": "This application demonstrates the power of Matryoshka embeddings (using Nomic Embed v1.5) for adaptive document retrieval. It allows you to adjust the embedding dimensions in real-time to see how the similarity between text passages changes, providing a unique view into how dimensionality affects semantic search.",
+      "category": "text-embedding",
+      "subcategory": "retrieval",
+      "valueRanking": 8,
+      "valueLabel": "High",
+      "modelName": "Nomic Embed v1.5",
+      "modelSize": "N/A",
+      "thumbnailUrl": "/images/models/adaptive-retrieval.png",
+      "screenshotUrls": [
+        "/images/screenshots/adaptive-retrieval-1.png",
+        "/images/screenshots/adaptive-retrieval-2.png"
+      ],
+      "demoUrl": "https://huggingface.co/spaces/webml-community/adaptive-retrieval",
+      "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/adaptive-retrieval",
+      "tags": ["text-embedding", "semantic-search", "matryoshka", "dimensionality"],
+      "features": ["Adjustable dimensions", "Real-time similarity scoring", "Text comparison"],
+      "performance": {
+        "loadTime": "~3 seconds",
+        "memoryUsage": "~200MB",
+        "browserSupport": ["All modern browsers"]
+      },
+      "relatedModels": ["pglite-semantic-search", "webgpu-nomic-embed", "cross-encoder"]
+    }
+  ],
+  "categories": [
+    {
+      "id": "llm",
+      "name": "Language Models",
+      "description": "Advanced conversational AIs like Llama, Phi, and SmolLM",
+      "color": "yellow",
+      "icon": "chat"
+    },
+    {
+      "id": "computer-vision",
+      "name": "Computer Vision",
+      "description": "Image analysis, depth estimation, and background removal",
+      "color": "blue",
+      "icon": "camera"
+    },
+    {
+      "id": "multimodal",
+      "name": "Multi-modal AI",
+      "description": "Models that understand both text and images",
+      "color": "purple",
+      "icon": "image-text"
+    },
+    {
+      "id": "speech",
+      "name": "Speech",
+      "description": "Recognition, synthesis and audio processing",
+      "color": "green",
+      "icon": "microphone"
+    },
+    {
+      "id": "text-embedding",
+      "name": "Embeddings",
+      "description": "Text and semantic search using vector embeddings",
+      "color": "red",
+      "icon": "database"
+    },
+    {
+      "id": "developer-tools",
+      "name": "Developer Tools",
+      "description": "Code generation and programming assistants",
+      "color": "indigo",
+      "icon": "code"
+    },
+    {
+      "id": "audio",
+      "name": "Audio Processing",
+      "description": "Audio analysis and generation",
+      "color": "pink",
+      "icon": "music"
+    },
+    {
+      "id": "education",
+      "name": "Educational",
+      "description": "Tools for learning about AI and models",
+      "color": "orange",
+      "icon": "book"
+    },
+    {
+      "id": "search",
+      "name": "Search & Retrieval",
+      "description": "Information retrieval and search capabilities",
+      "color": "teal",
+      "icon": "search"
+    }
+  ]
+}
