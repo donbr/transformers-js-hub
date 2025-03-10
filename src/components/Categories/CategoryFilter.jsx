@@ -112,7 +112,7 @@ const CategoryIcon = ({ category }) => {
   };
   
   return (
-    <div className={`w-8 h-8 rounded-full flex items-center justify-center bg-${category.color}-100 text-${category.color}-500`}>
+    <div className={`w-5 h-5 rounded-full flex items-center justify-center text-${category.color}-500`}>
       {getIcon(category.icon)}
     </div>
   );
