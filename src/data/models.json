@@ -9,7 +9,8 @@
       "subcategory": "chat",
       "valueRanking": 9,
       "valueLabel": "Very High",
-      "modelName": "Phi-3.5-mini-instruct",
+      "modelName": "onnx-community/Phi-3.5-mini-instruct-onnx-web",
+      "modelType": "text-generation",
       "modelSize": "2.7B parameters", 
       "thumbnailUrl": "/images/models/phi-3.5.png",
       "screenshotUrls": [
@@ -20,6 +21,11 @@
       "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/phi-3.5-webgpu",
       "tags": ["language-model", "chat", "webgpu", "microsoft"],
       "features": ["Conversational", "Instruction-tuned", "WebGPU-accelerated"],
+      "generationConfig": {
+        "max_new_tokens": 512,
+        "temperature": 0.7,
+        "top_p": 0.9
+      },
       "performance": {
         "loadTime": "~15 seconds",
         "memoryUsage": "~1.5GB",
@@ -36,7 +42,8 @@
       "subcategory": "chat",
       "valueRanking": 9,
       "valueLabel": "Very High",
-      "modelName": "Llama 3.2 8B",
+      "modelName": "onnx-community/Llama-3.2-1B-Instruct-q4f16",
+      "modelType": "text-generation",
       "modelSize": "8B parameters",
       "thumbnailUrl": "/images/models/llama-3.2.png",
       "screenshotUrls": [
@@ -47,6 +54,11 @@
       "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/llama-3.2-webgpu",
       "tags": ["language-model", "chat", "webgpu", "meta"],
       "features": ["Conversational", "Instruction-tuned", "WebGPU-accelerated"],
+      "generationConfig": {
+        "max_new_tokens": 512,
+        "temperature": 0.7,
+        "top_p": 0.9
+      },
       "performance": {
         "loadTime": "~20 seconds",
         "memoryUsage": "~2.0GB",
@@ -63,7 +75,8 @@
       "subcategory": "recognition",
       "valueRanking": 9,
       "valueLabel": "Very High",
-      "modelName": "Whisper Tiny.en",
+      "modelName": "openai/whisper-tiny.en-onnx",
+      "modelType": "speech-recognition",
       "modelSize": "39M parameters",
       "thumbnailUrl": "/images/models/whisper-realtime.png",
       "screenshotUrls": [
@@ -90,7 +103,8 @@
       "subcategory": "depth-estimation",
       "valueRanking": 8,
       "valueLabel": "High",
-      "modelName": "Depth Anything",
+      "modelName": "onnx-community/depth-anything-small-hf",
+      "modelType": "depth-estimation",
       "modelSize": "~20M parameters",
       "thumbnailUrl": "/images/models/depth-anything.png",
       "screenshotUrls": [
@@ -117,7 +131,8 @@
       "subcategory": "retrieval",
       "valueRanking": 8,
       "valueLabel": "High",
-      "modelName": "Nomic Embed v1.5",
+      "modelName": "nomic-ai/nomic-embed-text-v1.5",
+      "modelType": "feature-extraction",
       "modelSize": "N/A",
       "thumbnailUrl": "/images/models/adaptive-retrieval.png",
       "screenshotUrls": [
@@ -134,6 +149,150 @@
         "browserSupport": ["All modern browsers"]
       },
       "relatedModels": ["pglite-semantic-search", "webgpu-nomic-embed", "cross-encoder"]
+    },
+    {
+      "id": "cross-encoder",
+      "name": "Cross-Encoder Reranking",
+      "description": "Powerful reranking model for improving search relevance",
+      "longDescription": "This demo showcases the mxbai-rerank-xsmall-v1 cross-encoder model for reranking search results. Cross-encoders provide much higher accuracy than bi-encoders for ranking by processing query and document pairs together.",
+      "category": "text-embedding",
+      "subcategory": "reranking",
+      "valueRanking": 8,
+      "valueLabel": "High",
+      "modelName": "mixedbread-ai/mxbai-rerank-xsmall-v1",
+      "modelType": "zero-shot-classification",
+      "modelSize": "33M parameters",
+      "thumbnailUrl": "/images/models/cross-encoder.png",
+      "demoUrl": "https://huggingface.co/spaces/webml-community/cross-encoder",
+      "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/cross-encoder",
+      "tags": ["reranking", "search", "crossencoder", "ranking"],
+      "features": ["Document reranking", "Relevance scoring", "Text comparison"],
+      "performance": {
+        "loadTime": "~3 seconds",
+        "memoryUsage": "~150MB",
+        "browserSupport": ["All modern browsers"]
+      },
+      "relatedModels": ["adaptive-retrieval", "pglite-semantic-search", "zero-shot-classification"]
+    },
+    {
+      "id": "zero-shot-classification",
+      "name": "Zero-Shot Classification",
+      "description": "Classify text into any set of categories without specific training",
+      "longDescription": "This demo showcases zero-shot text classification, which allows you to classify text into arbitrary categories without having to fine-tune a model for each specific task. Just provide your categories and let the model determine the best match.",
+      "category": "text-embedding",
+      "subcategory": "classification",
+      "valueRanking": 7,
+      "valueLabel": "High",
+      "modelName": "MoritzLaurer/deberta-v3-xsmall-zeroshot-v1.1-all-33",
+      "modelType": "zero-shot-classification",
+      "modelSize": "33M parameters",
+      "thumbnailUrl": "/images/models/zero-shot-classification.png",
+      "demoUrl": "https://huggingface.co/spaces/webml-community/zero-shot-classification",
+      "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/zero-shot-classification",
+      "tags": ["classification", "nlp", "zero-shot"],
+      "features": ["Custom categories", "Multi-label classification", "No fine-tuning needed"],
+      "performance": {
+        "loadTime": "~2 seconds",
+        "memoryUsage": "~120MB",
+        "browserSupport": ["All modern browsers"]
+      },
+      "relatedModels": ["cross-encoder", "adaptive-retrieval", "pglite-semantic-search"]
+    },
+    {
+      "id": "speecht5-web",
+      "name": "SpeechT5 TTS",
+      "description": "Text-to-speech synthesis in your browser",
+      "longDescription": "This demo showcases text-to-speech synthesis using the SpeechT5 model. It converts text to realistic speech directly in your browser without any server-side processing. Choose from multiple speakers to generate different voice styles.",
+      "category": "speech",
+      "subcategory": "synthesis",
+      "valueRanking": 8,
+      "valueLabel": "High",
+      "modelName": "Xenova/speecht5_tts",
+      "modelType": "text-to-speech",
+      "modelSize": "120M parameters",
+      "thumbnailUrl": "/images/models/speecht5-web.png",
+      "demoUrl": "https://huggingface.co/spaces/webml-community/speecht5-web",
+      "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/speecht5-web",
+      "tags": ["text-to-speech", "tts", "audio-generation", "speech-synthesis"],
+      "features": ["Multiple speakers", "Customizable voice", "No server required"],
+      "performance": {
+        "loadTime": "~4 seconds",
+        "memoryUsage": "~200MB",
+        "browserSupport": ["Chrome", "Firefox", "Safari", "Edge"]
+      },
+      "relatedModels": ["text-to-speech-webgpu", "realtime-whisper-webgpu", "whisper-word-timestamps"]
+    },
+    {
+      "id": "text-to-speech-webgpu",
+      "name": "OuteTTS WebGPU",
+      "description": "Multilingual text-to-speech synthesis with WebGPU acceleration",
+      "longDescription": "This demo showcases OuteTTS, a multilingual text-to-speech model that runs entirely in your browser with WebGPU acceleration. It supports English, Chinese, Japanese, and Korean languages with natural-sounding speech generation.",
+      "category": "speech",
+      "subcategory": "synthesis",
+      "valueRanking": 9,
+      "valueLabel": "Very High",
+      "modelName": "onnx-community/OuteTTS-0.2-500M",
+      "modelType": "text-to-speech",
+      "modelSize": "500M parameters",
+      "thumbnailUrl": "/images/models/text-to-speech-webgpu.png",
+      "demoUrl": "https://huggingface.co/spaces/webml-community/text-to-speech-webgpu",
+      "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/text-to-speech-webgpu",
+      "tags": ["text-to-speech", "tts", "webgpu", "multilingual"],
+      "features": ["Multiple languages", "WebGPU acceleration", "Voice customization"],
+      "performance": {
+        "loadTime": "~8 seconds",
+        "memoryUsage": "~800MB",
+        "browserSupport": ["Chrome", "Edge", "Safari TP"]
+      },
+      "relatedModels": ["speecht5-web", "realtime-whisper-webgpu", "whisper-word-timestamps"]
+    },
+    {
+      "id": "florence2-webgpu",
+      "name": "Florence 2 WebGPU",
+      "description": "Versatile vision foundation model with multiple vision capabilities",
+      "longDescription": "This demo showcases Florence-2, a vision foundation model that can perform various vision-language tasks like captioning, OCR, object detection, and more. It runs entirely in your browser with WebGPU acceleration.",
+      "category": "multimodal",
+      "subcategory": "vision-foundation",
+      "valueRanking": 9,
+      "valueLabel": "Very High",
+      "modelName": "onnx-community/Florence-2-base-ft",
+      "modelType": "image-classification",
+      "modelSize": "230M parameters",
+      "thumbnailUrl": "/images/models/florence2-webgpu.png",
+      "demoUrl": "https://huggingface.co/spaces/webml-community/florence2-webgpu",
+      "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/florence2-webgpu",
+      "tags": ["vision", "multimodal", "webgpu", "captioning", "ocr"],
+      "features": ["Image captioning", "OCR", "Object detection", "WebGPU-accelerated"],
+      "performance": {
+        "loadTime": "~10 seconds",
+        "memoryUsage": "~400MB",
+        "browserSupport": ["Chrome", "Edge", "Safari TP"]
+      },
+      "relatedModels": ["depth-anything", "janus-webgpu", "smolvlm-webgpu"]
+    },
+    {
+      "id": "janus-webgpu",
+      "name": "Janus WebGPU",
+      "description": "Text-to-image generation in your browser with WebGPU",
+      "longDescription": "This demo showcases Janus, a multimodal model that can generate images from text prompts right in your browser using WebGPU acceleration. It's a compact but powerful text-to-image model that delivers impressive results without requiring a server.",
+      "category": "multimodal",
+      "subcategory": "text-to-image",
+      "valueRanking": 9,
+      "valueLabel": "Very High",
+      "modelName": "onnx-community/Janus-1.3B-ONNX",
+      "modelType": "text-generation",
+      "modelSize": "1.3B parameters",
+      "thumbnailUrl": "/images/models/janus-webgpu.png",
+      "demoUrl": "https://huggingface.co/spaces/webml-community/janus-webgpu",
+      "sourceUrl": "https://github.com/huggingface/transformers.js-examples/tree/main/janus-webgpu",
+      "tags": ["text-to-image", "image-generation", "webgpu", "multimodal"],
+      "features": ["Text-to-image", "WebGPU acceleration", "Chat interface"],
+      "performance": {
+        "loadTime": "~15 seconds",
+        "memoryUsage": "~1.5GB",
+        "browserSupport": ["Chrome", "Edge", "Safari TP"]
+      },
+      "relatedModels": ["janus-pro-webgpu", "florence2-webgpu", "smolvlm-webgpu"]
     }
   ],
   "categories": [

@@ -20,7 +20,7 @@ A central hub for exploring and trying out 35+ AI models from the Transformers.j
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/transformers-js-hub.git
+git clone https://github.com/donbr/transformers-js-hub.git
 cd transformers-js-hub
 ```
 
