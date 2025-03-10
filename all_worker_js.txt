@@ -1,0 +1,3205 @@
+----- .\adaptive-retrieval\src\worker.js -----
+
+import { pipeline } from "@huggingface/transformers";
+
+class MyFeatureExtractionPipeline {
+  static task = "feature-extraction";
+  static model = "nomic-ai/nomic-embed-text-v1.5";
+  static instance = null;
+
+  static async getInstance(progress_callback = null) {
+    this.instance ??= pipeline(this.task, this.model, {
+      dtype: "q8",
+      progress_callback,
+    });
+
+    return this.instance;
+  }
+}
+
+// https://huggingface.co/nomic-ai/nomic-embed-text-v1.5#usage
+const SEARCH_PREFIX = "search_query: ";
+const DOCUMENT_PREFIX = "search_document: ";
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (event) => {
+  // Retrieve the pipeline. When called for the first time,
+  // this will load the pipeline and save it for future use.
+  const extractor = await MyFeatureExtractionPipeline.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  const { source, text } = event.data;
+
+  const split = [
+    SEARCH_PREFIX + source,
+    ...text
+      .trim()
+      .split("\n")
+      .map((x) => DOCUMENT_PREFIX + x),
+  ];
+  const embeddings = await extractor(split, {
+    pooling: "mean",
+    normalize: true,
+  });
+
+  // Send the output back to the main thread
+  self.postMessage({ status: "complete", embeddings: embeddings.tolist() });
+});
+
+
+----- .\attention-visualization\src\worker.js -----
+
+import {
+  AutoProcessor,
+  AutoModelForImageClassification,
+  interpolate_4d,
+  RawImage,
+  softmax,
+} from "@huggingface/transformers";
+
+export async function supportsWebGPU() {
+  try {
+    if (!navigator.gpu) return false;
+    return !!(await navigator.gpu.requestAdapter());
+  } catch (e) {
+    return false;
+  }
+}
+
+const webgpu = await supportsWebGPU();
+// Load model and processor
+const model_id = "onnx-community/dinov2-with-registers-small-with-attentions";
+const model = await AutoModelForImageClassification.from_pretrained(model_id, {
+  device: webgpu ? "webgpu" : "wasm",
+  dtype: webgpu ? "q4" : "q8",
+}).catch((error) => {
+  console.error(error);
+  self.postMessage({ type: "error", error: error.toString() });
+  throw error;
+});
+const processor = await AutoProcessor.from_pretrained(model_id).catch(
+  (error) => {
+    console.error(error);
+    self.postMessage({ type: "error", error: error.toString() });
+    throw error;
+  },
+);
+
+self.postMessage({ type: "status", status: "ready" });
+
+const MAX_IMAGE_SIZE = 800;
+self.onmessage = async (event) => {
+  const { image } = event.data;
+  self.postMessage({ type: "status", status: "read_image" });
+
+  let raw_image = await RawImage.read(image);
+  if (raw_image.width > MAX_IMAGE_SIZE || raw_image.height > MAX_IMAGE_SIZE) {
+    const aspect_ratio = raw_image.width / raw_image.height;
+    let new_width, new_height;
+    if (raw_image.width > raw_image.height) {
+      new_width = MAX_IMAGE_SIZE;
+      new_height = Math.round(MAX_IMAGE_SIZE / aspect_ratio);
+    } else {
+      new_height = MAX_IMAGE_SIZE;
+      new_width = Math.round(MAX_IMAGE_SIZE * aspect_ratio);
+    }
+    raw_image = await raw_image.resize(new_width, new_height);
+  }
+
+  // Pre-process image
+  const inputs = await processor(raw_image);
+
+  self.postMessage({ type: "status", status: "run_model" });
+
+  // Perform inference
+  const { logits, attentions } = await model(inputs);
+
+  self.postMessage({ type: "status", status: "postprocess" });
+
+  // Get the predicted class
+  const scores = logits[0];
+  const probabilities = softmax(scores.data);
+  const cls = scores.argmax().item();
+
+  const score = probabilities[cls] * 100;
+  const label = model.config.id2label[cls];
+  console.log(`Predicted class: ${label}`);
+
+  // Set config values
+  const patch_size = model.config.patch_size;
+  const [width, height] = inputs.pixel_values.dims.slice(-2);
+  const w_featmap = Math.floor(width / patch_size);
+  const h_featmap = Math.floor(height / patch_size);
+  const num_heads = model.config.num_attention_heads;
+  const num_cls_tokens = 1;
+  const num_register_tokens = model.config.num_register_tokens ?? 0;
+
+  // Visualize attention maps
+  const output = [];
+  for (let i = 0; i < attentions.length; ++i) {
+    const layer = attentions[i];
+
+    const selected_attentions = layer
+      .slice(0, null, 0, [num_cls_tokens + num_register_tokens, null])
+      .view(num_heads, 1, w_featmap, h_featmap);
+
+    const upscaled = await interpolate_4d(selected_attentions, {
+      size: [width, height],
+      mode: "nearest",
+    });
+
+    for (let j = 0; j < num_heads; ++j) {
+      const head_attentions = upscaled[j];
+      const minval = head_attentions.min().item();
+      const maxval = head_attentions.max().item();
+      const map = RawImage.fromTensor(
+        head_attentions
+          .sub_(minval)
+          .div_(maxval - minval)
+          .mul_(255)
+          .to("uint8"),
+      ).rgba();
+      const image = await createImageBitmap(
+        new ImageData(map.data, map.width, map.height),
+        {
+          imageOrientation: "flipY",
+        },
+      );
+      output.push({
+        layer: i,
+        head: j,
+        num_heads,
+        image,
+      });
+    }
+  }
+
+  self.postMessage({
+    type: "output",
+    result: {
+      attentions: output,
+      label,
+      score,
+    },
+  });
+};
+
+
+----- .\code-completion\src\worker.js -----
+
+import { pipeline, TextStreamer } from "@huggingface/transformers";
+
+/**
+ * This class uses the Singleton pattern to ensure that only one instance of the pipeline is loaded.
+ */
+class CodeCompletionPipeline {
+  static task = "text-generation";
+  static model = null;
+  static instance = null;
+
+  static async getInstance(progress_callback = null) {
+    this.instance ??= pipeline(this.task, this.model, { progress_callback });
+
+    return this.instance;
+  }
+}
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (event) => {
+  const {
+    model,
+    text,
+    max_new_tokens,
+
+    // Generation parameters
+    temperature,
+    top_k,
+    do_sample,
+  } = event.data;
+
+  if (CodeCompletionPipeline.model !== model) {
+    // Invalidate model if different
+    CodeCompletionPipeline.model = model;
+
+    if (CodeCompletionPipeline.instance !== null) {
+      (await CodeCompletionPipeline.getInstance()).dispose();
+      CodeCompletionPipeline.instance = null;
+    }
+  }
+
+  // Retrieve the code-completion pipeline. When called for the first time,
+  // this will load the pipeline and save it for future use.
+  const generator = await CodeCompletionPipeline.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  const streamer = new TextStreamer(generator.tokenizer, {
+    skip_prompt: true,
+    callback_function: (x) => {
+      console.log(x);
+      self.postMessage({
+        status: "update",
+        output: x,
+      });
+    },
+  });
+  // self.postMessage({
+  //     status: 'update',
+  //     output: generator.tokenizer.decode(x[0].output_token_ids, { skip_special_tokens: true })
+  // });
+
+  // Actually perform the code-completion
+  console.log(text);
+  const output = await generator(text, {
+    max_new_tokens,
+    temperature,
+    top_k,
+    do_sample,
+    streamer,
+  });
+
+  // Send the output back to the main thread
+  self.postMessage({
+    status: "complete",
+    output: output,
+  });
+  console.log(output);
+});
+
+
+----- .\cross-encoder\src\worker.js -----
+
+import {
+  AutoTokenizer,
+  AutoModelForSequenceClassification,
+} from "@huggingface/transformers";
+
+class CrossEncoderSingleton {
+  static model_id = "mixedbread-ai/mxbai-rerank-xsmall-v1";
+  static model = null;
+  static tokenizer = null;
+
+  static async getInstance(progress_callback) {
+    this.tokenizer ??= AutoTokenizer.from_pretrained(this.model_id);
+
+    this.model ??= AutoModelForSequenceClassification.from_pretrained(
+      this.model_id,
+      {
+        progress_callback,
+      },
+    );
+
+    return Promise.all([this.tokenizer, this.model]);
+  }
+}
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (event) => {
+  // Retrieve the pipeline. When called for the first time,
+  // this will load the pipeline and save it for future use.
+  const [tokenizer, model] = await CrossEncoderSingleton.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  const { query, documents } = event.data;
+
+  const docs = documents.trim().split("\n");
+
+  const inputs = tokenizer(new Array(docs.length).fill(query), {
+    text_pair: docs,
+    padding: true,
+    truncation: true,
+  });
+  const { logits } = await model(inputs);
+  const output = logits
+    .sigmoid()
+    .tolist()
+    .map(([score], i) => ({
+      corpus_id: i,
+      score,
+      text: docs[i],
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  // Send the output back to the main thread
+  self.postMessage({ status: "complete", output });
+});
+
+
+----- .\deepseek-r1-webgpu\src\worker.js -----
+
+import {
+  AutoTokenizer,
+  AutoModelForCausalLM,
+  TextStreamer,
+  InterruptableStoppingCriteria,
+} from "@huggingface/transformers";
+
+/**
+ * Helper function to perform feature detection for WebGPU
+ */
+// let fp16_supported = false;
+async function check() {
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error("WebGPU is not supported (no adapter found)");
+    }
+    // fp16_supported = adapter.features.has("shader-f16")
+  } catch (e) {
+    self.postMessage({
+      status: "error",
+      data: e.toString(),
+    });
+  }
+}
+
+/**
+ * This class uses the Singleton pattern to enable lazy-loading of the pipeline
+ */
+class TextGenerationPipeline {
+  static model_id = "onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX";
+
+  static async getInstance(progress_callback = null) {
+    this.tokenizer ??= AutoTokenizer.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+
+    this.model ??= AutoModelForCausalLM.from_pretrained(this.model_id, {
+      dtype: "q4f16",
+      device: "webgpu",
+      progress_callback,
+    });
+
+    return Promise.all([this.tokenizer, this.model]);
+  }
+}
+
+const stopping_criteria = new InterruptableStoppingCriteria();
+
+let past_key_values_cache = null;
+async function generate(messages) {
+  // Retrieve the text-generation pipeline.
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance();
+
+  const inputs = tokenizer.apply_chat_template(messages, {
+    add_generation_prompt: true,
+    return_dict: true,
+  });
+
+  // 151648: <think>
+  // 151649: </think>
+  const [START_THINKING_TOKEN_ID, END_THINKING_TOKEN_ID] = tokenizer.encode(
+    "<think></think>",
+    { add_special_tokens: false },
+  );
+
+  let state = "thinking"; // 'thinking' or 'answering'
+  let startTime;
+  let numTokens = 0;
+  let tps;
+  const token_callback_function = (tokens) => {
+    startTime ??= performance.now();
+
+    if (numTokens++ > 0) {
+      tps = (numTokens / (performance.now() - startTime)) * 1000;
+    }
+    if (tokens[0] == END_THINKING_TOKEN_ID) {
+      state = "answering";
+    }
+  };
+  const callback_function = (output) => {
+    self.postMessage({
+      status: "update",
+      output,
+      tps,
+      numTokens,
+      state,
+    });
+  };
+
+  const streamer = new TextStreamer(tokenizer, {
+    skip_prompt: true,
+    skip_special_tokens: true,
+    callback_function,
+    token_callback_function,
+  });
+
+  // Tell the main thread we are starting
+  self.postMessage({ status: "start" });
+
+  const { past_key_values, sequences } = await model.generate({
+    ...inputs,
+    // TODO: Add back when fixed
+    // past_key_values: past_key_values_cache,
+
+    // Sampling
+    do_sample: false,
+    // repetition_penalty: 1.1,
+    // top_k: 3,
+    // temperature: 0.2,
+
+    max_new_tokens: 2048,
+    streamer,
+    stopping_criteria,
+    return_dict_in_generate: true,
+  });
+  past_key_values_cache = past_key_values;
+
+  const decoded = tokenizer.batch_decode(sequences, {
+    skip_special_tokens: true,
+  });
+
+  // Send the output back to the main thread
+  self.postMessage({
+    status: "complete",
+    output: decoded,
+  });
+}
+
+async function load() {
+  self.postMessage({
+    status: "loading",
+    data: "Loading model...",
+  });
+
+  // Load the pipeline and save it for future use.
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  self.postMessage({
+    status: "loading",
+    data: "Compiling shaders and warming up model...",
+  });
+
+  // Run model with dummy input to compile shaders
+  const inputs = tokenizer("a");
+  await model.generate({ ...inputs, max_new_tokens: 1 });
+  self.postMessage({ status: "ready" });
+}
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case "check":
+      check();
+      break;
+
+    case "load":
+      load();
+      break;
+
+    case "generate":
+      stopping_criteria.reset();
+      generate(data);
+      break;
+
+    case "interrupt":
+      stopping_criteria.interrupt();
+      break;
+
+    case "reset":
+      past_key_values_cache = null;
+      stopping_criteria.reset();
+      break;
+  }
+});
+
+
+----- .\florence2-webgpu\src\worker.js -----
+
+import {
+  Florence2ForConditionalGeneration,
+  AutoProcessor,
+  AutoTokenizer,
+  RawImage,
+  full,
+} from "@huggingface/transformers";
+
+async function hasFp16() {
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    return adapter.features.has("shader-f16");
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * This class uses the Singleton pattern to ensure that only one instance of the model is loaded.
+ */
+class Florence2Singleton {
+  static model_id = "onnx-community/Florence-2-base-ft";
+
+  static async getInstance(progress_callback = null) {
+    this.processor ??= AutoProcessor.from_pretrained(this.model_id);
+    this.tokenizer ??= AutoTokenizer.from_pretrained(this.model_id);
+
+    this.supports_fp16 ??= await hasFp16();
+    this.model ??= Florence2ForConditionalGeneration.from_pretrained(
+      this.model_id,
+      {
+        dtype: {
+          embed_tokens: this.supports_fp16 ? "fp16" : "fp32",
+          vision_encoder: this.supports_fp16 ? "fp16" : "fp32",
+          encoder_model: "q4", // or 'fp16' or 'fp32'
+          decoder_model_merged: "q4", // or 'fp16' or 'fp32'
+        },
+        device: "webgpu",
+        progress_callback,
+      },
+    );
+
+    return Promise.all([this.model, this.tokenizer, this.processor]);
+  }
+}
+
+async function load() {
+  self.postMessage({
+    status: "loading",
+    data: "Loading model...",
+  });
+
+  // Load the pipeline and save it for future use.
+  const [model, tokenizer, processor] = await Florence2Singleton.getInstance(
+    (x) => {
+      // We also add a progress callback to the pipeline so that we can
+      // track model loading.
+      self.postMessage(x);
+    },
+  );
+
+  self.postMessage({
+    status: "loading",
+    data: "Compiling shaders and warming up model...",
+  });
+
+  // Dummy text and vision inputs
+  const text_inputs = tokenizer("a");
+  const pixel_values = full([1, 3, 768, 768], 0.0);
+
+  // Run model with dummy input to compile shaders
+  await model.generate({
+    ...text_inputs,
+    pixel_values,
+    max_new_tokens: 1,
+  });
+
+  self.postMessage({ status: "ready" });
+}
+
+const TASKS_WITH_INPUTS = ["<CAPTION_TO_PHRASE_GROUNDING>"];
+
+let vision_inputs;
+let image_size;
+async function run({ text, url, task }) {
+  const [model, tokenizer, processor] = await Florence2Singleton.getInstance();
+
+  // Read and preprocess image
+  const start = performance.now();
+  if (!vision_inputs) {
+    // Cache vision inputs when possible
+    const image = await RawImage.fromURL(url);
+    image_size = image.size;
+    vision_inputs = await processor(image);
+  }
+
+  let user_input = task;
+  if (TASKS_WITH_INPUTS.includes(task) && text) {
+    user_input += text;
+  }
+  const prompts = processor.construct_prompts(user_input);
+  const text_inputs = tokenizer(prompts);
+
+  // Generate text
+  const generated_ids = await model.generate({
+    ...text_inputs,
+    ...vision_inputs,
+    max_new_tokens: 128,
+    num_beams: 1,
+    do_sample: false,
+  });
+
+  // Decode generated text
+  const generated_text = tokenizer.batch_decode(generated_ids, {
+    skip_special_tokens: false,
+  })[0];
+
+  // Post-process the generated text
+  const result = processor.post_process_generation(
+    generated_text,
+    task,
+    image_size,
+  );
+
+  const end = performance.now();
+
+  self.postMessage({ status: "complete", result, time: end - start });
+}
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case "load":
+      load();
+      break;
+
+    case "run":
+      run(data);
+      break;
+
+    case "reset":
+      vision_inputs = image_size = null;
+      break;
+  }
+});
+
+
+----- .\janus-pro-webgpu\src\worker.js -----
+
+import {
+  AutoProcessor,
+  MultiModalityCausalLM,
+  BaseStreamer,
+  TextStreamer,
+  InterruptableStoppingCriteria,
+} from "@huggingface/transformers";
+
+// Define constants
+const IMAGE_GENERATION_COMMAND_PREFIX = "/imagine ";
+const MAX_NEW_TEXT_TOKENS = 1024;
+
+/**
+ * Helper function to perform WebGPU feature detection
+ */
+let fp16_supported = false;
+async function check() {
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error("WebGPU is not supported (no adapter found)");
+    }
+    fp16_supported = adapter.features.has("shader-f16");
+    self.postMessage({
+      status: "success",
+      data: fp16_supported,
+    });
+  } catch (e) {
+    self.postMessage({
+      status: "error",
+      data: e.toString(),
+    });
+  }
+}
+
+/**
+ * This class uses the Singleton pattern to enable lazy-loading of the pipeline
+ */
+class ImageGenerationPipeline {
+  static model_id = "onnx-community/Janus-Pro-1B-ONNX";
+
+  static async getInstance(progress_callback = null) {
+    this.processor ??= AutoProcessor.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+
+    this.model ??= MultiModalityCausalLM.from_pretrained(this.model_id, {
+      dtype: fp16_supported
+        ? {
+            prepare_inputs_embeds: "q4",
+            language_model: "q4f16",
+            lm_head: "fp16",
+            gen_head: "fp16",
+            gen_img_embeds: "fp16",
+            image_decode: "fp32",
+          }
+        : {
+            prepare_inputs_embeds: "fp32",
+            language_model: "q4",
+            lm_head: "fp32",
+            gen_head: "fp32",
+            gen_img_embeds: "fp32",
+            image_decode: "fp32",
+          },
+      device: {
+        prepare_inputs_embeds: "wasm", // TODO use "webgpu" when bug is fixed
+        language_model: "webgpu",
+        lm_head: "webgpu",
+        gen_head: "webgpu",
+        gen_img_embeds: "webgpu",
+        image_decode: "webgpu",
+      },
+      progress_callback,
+    });
+
+    return Promise.all([this.processor, this.model]);
+  }
+}
+
+class ProgressStreamer extends BaseStreamer {
+  constructor(total, on_progress) {
+    super();
+    this.total = total;
+    this.on_progress = on_progress;
+
+    this.count = null;
+    this.start_time = null;
+  }
+
+  put(value) {
+    if (this.count === null) {
+      // Ignore the first batch of tokens (prompt)
+      this.count = 0;
+      this.start_time = performance.now();
+      return;
+    }
+
+    const progress = ++this.count / this.total;
+
+    this.on_progress({
+      count: this.count,
+      total: this.total,
+      progress,
+      time: performance.now() - this.start_time,
+    });
+  }
+
+  end() {
+    /* no nothing */
+  }
+}
+
+const stopping_criteria = new InterruptableStoppingCriteria();
+
+async function generate(messages) {
+  // For this demo, we only respond to the last message
+  const message = messages.at(-1);
+
+  // Tell the main thread we are starting
+  self.postMessage({ status: "start" });
+
+  // Load the pipeline
+  const [processor, model] = await ImageGenerationPipeline.getInstance();
+
+  // Determine if the user wants to generate an image or text
+  if (message.content.startsWith(IMAGE_GENERATION_COMMAND_PREFIX)) {
+    const text = message.content.replace(IMAGE_GENERATION_COMMAND_PREFIX, "");
+
+    const conversation = [
+      {
+        role: "<|User|>", // uses title case
+        content: text,
+      },
+    ];
+    const inputs = await processor(conversation, {
+      chat_template: "text_to_image",
+    });
+
+    const callback_function = (output) => {
+      self.postMessage({
+        status: "image-update",
+        ...output,
+      });
+    };
+
+    const num_image_tokens = processor.num_image_tokens;
+    const streamer = new ProgressStreamer(num_image_tokens, callback_function);
+
+    const outputs = await model.generate_images({
+      ...inputs,
+      min_new_tokens: num_image_tokens,
+      max_new_tokens: num_image_tokens,
+      do_sample: true,
+      streamer,
+    });
+
+    const blob = await outputs[0].toBlob();
+
+    // Send the output back to the main thread
+    self.postMessage({
+      status: "image-update",
+      blob,
+    });
+  } else {
+    const inputs = await processor(
+      message.image
+        ? [
+            {
+              role: "<|User|>",
+              content: "<image_placeholder>\n" + message.content,
+              images: [message.image],
+            },
+          ]
+        : [
+            {
+              role: "<|System|>",
+              content:
+                "You are a helpful assistant. Answer the user's questions in a concise manner.",
+            },
+            {
+              role: "<|User|>",
+              content: message.content,
+            },
+          ],
+    );
+
+    let startTime;
+    let numTokens = 0;
+    let tps;
+    const token_callback_function = () => {
+      startTime ??= performance.now();
+
+      if (numTokens++ > 0) {
+        tps = (numTokens / (performance.now() - startTime)) * 1000;
+      }
+    };
+    const callback_function = (output) => {
+      self.postMessage({
+        status: "text-update",
+        output,
+        tps,
+        numTokens,
+      });
+    };
+
+    const streamer = new TextStreamer(processor.tokenizer, {
+      skip_prompt: true,
+      skip_special_tokens: true,
+      callback_function,
+      token_callback_function,
+    });
+
+    // Generate response
+    const outputs = await model.generate({
+      ...inputs,
+      max_new_tokens: MAX_NEW_TEXT_TOKENS,
+      do_sample: false,
+      streamer,
+      stopping_criteria,
+    });
+  }
+
+  // Tell the main thread we are done
+  self.postMessage({
+    status: "complete",
+  });
+}
+
+async function load() {
+  self.postMessage({
+    status: "loading",
+    data: "Loading model...",
+  });
+
+  // Load the pipeline and save it for future use.
+  const [processor, model] = await ImageGenerationPipeline.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  self.postMessage({ status: "ready" });
+}
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case "check":
+      check();
+      break;
+
+    case "load":
+      load();
+      break;
+
+    case "generate":
+      stopping_criteria.reset();
+      generate(data);
+      break;
+
+    case "interrupt":
+      stopping_criteria.interrupt();
+      break;
+
+    case "reset":
+      stopping_criteria.reset();
+      break;
+  }
+});
+
+
+----- .\janus-webgpu\src\worker.js -----
+
+import {
+  AutoProcessor,
+  MultiModalityCausalLM,
+  BaseStreamer,
+  TextStreamer,
+  InterruptableStoppingCriteria,
+} from "@huggingface/transformers";
+
+// Define constants
+const IMAGE_GENERATION_COMMAND_PREFIX = "/imagine ";
+const MAX_NEW_TEXT_TOKENS = 1024;
+
+/**
+ * Helper function to perform WebGPU feature detection
+ */
+let fp16_supported = false;
+async function check() {
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error("WebGPU is not supported (no adapter found)");
+    }
+    fp16_supported = adapter.features.has("shader-f16");
+    self.postMessage({
+      status: "success",
+      data: fp16_supported,
+    });
+  } catch (e) {
+    self.postMessage({
+      status: "error",
+      data: e.toString(),
+    });
+  }
+}
+
+/**
+ * This class uses the Singleton pattern to enable lazy-loading of the pipeline
+ */
+class ImageGenerationPipeline {
+  static model_id = "onnx-community/Janus-1.3B-ONNX";
+
+  static async getInstance(progress_callback = null) {
+    this.processor ??= AutoProcessor.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+
+    this.model ??= MultiModalityCausalLM.from_pretrained(this.model_id, {
+      dtype: fp16_supported
+        ? {
+            prepare_inputs_embeds: "q4",
+            language_model: "q4f16",
+            lm_head: "fp16",
+            gen_head: "fp16",
+            gen_img_embeds: "fp16",
+            image_decode: "fp32",
+          }
+        : {
+            prepare_inputs_embeds: "fp32",
+            language_model: "q4",
+            lm_head: "fp32",
+            gen_head: "fp32",
+            gen_img_embeds: "fp32",
+            image_decode: "fp32",
+          },
+      device: {
+        prepare_inputs_embeds: "wasm", // TODO use "webgpu" when bug is fixed
+        language_model: "webgpu",
+        lm_head: "webgpu",
+        gen_head: "webgpu",
+        gen_img_embeds: "webgpu",
+        image_decode: "webgpu",
+      },
+      progress_callback,
+    });
+
+    return Promise.all([this.processor, this.model]);
+  }
+}
+
+class ProgressStreamer extends BaseStreamer {
+  constructor(total, on_progress) {
+    super();
+    this.total = total;
+    this.on_progress = on_progress;
+
+    this.count = null;
+    this.start_time = null;
+  }
+
+  put(value) {
+    if (this.count === null) {
+      // Ignore the first batch of tokens (prompt)
+      this.count = 0;
+      this.start_time = performance.now();
+      return;
+    }
+
+    const progress = ++this.count / this.total;
+
+    this.on_progress({
+      count: this.count,
+      total: this.total,
+      progress,
+      time: performance.now() - this.start_time,
+    });
+  }
+
+  end() {
+    /* no nothing */
+  }
+}
+
+const stopping_criteria = new InterruptableStoppingCriteria();
+
+async function generate(messages) {
+  // For this demo, we only respond to the last message
+  const message = messages.at(-1);
+
+  // Tell the main thread we are starting
+  self.postMessage({ status: "start" });
+
+  // Load the pipeline
+  const [processor, model] = await ImageGenerationPipeline.getInstance();
+
+  // Determine if the user wants to generate an image or text
+  if (message.content.startsWith(IMAGE_GENERATION_COMMAND_PREFIX)) {
+    const text = message.content.replace(IMAGE_GENERATION_COMMAND_PREFIX, "");
+
+    const conversation = [
+      {
+        role: "User", // uses title case
+        content: text,
+      },
+    ];
+    const inputs = await processor(conversation, {
+      chat_template: "text_to_image",
+    });
+
+    const callback_function = (output) => {
+      self.postMessage({
+        status: "image-update",
+        ...output,
+      });
+    };
+
+    const num_image_tokens = processor.num_image_tokens;
+    const streamer = new ProgressStreamer(num_image_tokens, callback_function);
+
+    const outputs = await model.generate_images({
+      ...inputs,
+      min_new_tokens: num_image_tokens,
+      max_new_tokens: num_image_tokens,
+      do_sample: true,
+      streamer,
+    });
+
+    const blob = await outputs[0].toBlob();
+
+    // Send the output back to the main thread
+    self.postMessage({
+      status: "image-update",
+      blob,
+    });
+  } else {
+    const inputs = await processor(
+      message.image
+        ? [
+            {
+              role: "User",
+              content: "<image_placeholder>\n" + message.content,
+              images: [message.image],
+            },
+          ]
+        : [
+            {
+              role: "System",
+              content:
+                "You are a helpful assistant. Answer the user's questions in a concise manner.",
+            },
+            {
+              role: "User",
+              content: message.content,
+            },
+          ],
+    );
+
+    let startTime;
+    let numTokens = 0;
+    let tps;
+    const token_callback_function = () => {
+      startTime ??= performance.now();
+
+      if (numTokens++ > 0) {
+        tps = (numTokens / (performance.now() - startTime)) * 1000;
+      }
+    };
+    const callback_function = (output) => {
+      self.postMessage({
+        status: "text-update",
+        output,
+        tps,
+        numTokens,
+      });
+    };
+
+    const streamer = new TextStreamer(processor.tokenizer, {
+      skip_prompt: true,
+      skip_special_tokens: true,
+      callback_function,
+      token_callback_function,
+    });
+
+    // Generate response
+    const outputs = await model.generate({
+      ...inputs,
+      max_new_tokens: MAX_NEW_TEXT_TOKENS,
+      do_sample: false,
+      streamer,
+      stopping_criteria,
+    });
+  }
+
+  // Tell the main thread we are done
+  self.postMessage({
+    status: "complete",
+  });
+}
+
+async function load() {
+  self.postMessage({
+    status: "loading",
+    data: "Loading model...",
+  });
+
+  // Load the pipeline and save it for future use.
+  const [processor, model] = await ImageGenerationPipeline.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  self.postMessage({ status: "ready" });
+}
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case "check":
+      check();
+      break;
+
+    case "load":
+      load();
+      break;
+
+    case "generate":
+      stopping_criteria.reset();
+      generate(data);
+      break;
+
+    case "interrupt":
+      stopping_criteria.interrupt();
+      break;
+
+    case "reset":
+      stopping_criteria.reset();
+      break;
+  }
+});
+
+
+----- .\llama-3.2-reasoning-webgpu\src\worker.js -----
+
+import {
+  AutoTokenizer,
+  AutoModelForCausalLM,
+  TextStreamer,
+  InterruptableStoppingCriteria,
+} from "@huggingface/transformers";
+
+/**
+ * Helper function to perform feature detection for WebGPU
+ */
+// let fp16_supported = false;
+async function check() {
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error("WebGPU is not supported (no adapter found)");
+    }
+    // fp16_supported = adapter.features.has("shader-f16")
+  } catch (e) {
+    self.postMessage({
+      status: "error",
+      data: e.toString(),
+    });
+  }
+}
+
+/**
+ * This class uses the Singleton pattern to enable lazy-loading of the pipeline
+ */
+class TextGenerationPipeline {
+  static model_id = "ngxson/MiniThinky-v2-1B-Llama-3.2";
+
+  static async getInstance(progress_callback = null) {
+    this.tokenizer ??= AutoTokenizer.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+
+    this.model ??= AutoModelForCausalLM.from_pretrained(this.model_id, {
+      dtype: "q4f16", // TODO: use "q4" as fallback when fixed
+      device: "webgpu",
+      progress_callback,
+    });
+
+    return Promise.all([this.tokenizer, this.model]);
+  }
+}
+
+const stopping_criteria = new InterruptableStoppingCriteria();
+
+let past_key_values_cache = null;
+async function generate(messages) {
+  // Retrieve the text-generation pipeline.
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance();
+
+  messages = [
+    {
+      role: "system",
+      content:
+        "You are MiniThinky, a helpful AI assistant. You always think before giving the answer. Use <|thinking|> before thinking and <|answer|> before giving the answer.",
+    },
+    ...messages,
+  ];
+  const inputs = tokenizer.apply_chat_template(messages, {
+    add_generation_prompt: true,
+    return_dict: true,
+  });
+
+  // 128011: <|thinking|>
+  // 128012: <|answer|>
+  const [THINKING_TOKEN_ID, ANSWER_TOKEN_ID] = tokenizer.encode(
+    "<|thinking|><|answer|>",
+    { add_special_tokens: false },
+  );
+
+  let state = "thinking"; // 'thinking' or 'answering'
+  let startTime;
+  let numTokens = 0;
+  let tps;
+  const token_callback_function = (tokens) => {
+    startTime ??= performance.now();
+
+    if (numTokens++ > 0) {
+      tps = (numTokens / (performance.now() - startTime)) * 1000;
+    }
+    if (tokens[0] == ANSWER_TOKEN_ID) {
+      state = "answering";
+    }
+  };
+  const callback_function = (output) => {
+    self.postMessage({
+      status: "update",
+      output,
+      tps,
+      numTokens,
+      state,
+    });
+  };
+
+  const streamer = new TextStreamer(tokenizer, {
+    skip_prompt: true,
+    skip_special_tokens: true,
+    callback_function,
+    token_callback_function,
+  });
+
+  // Tell the main thread we are starting
+  self.postMessage({ status: "start" });
+
+  const { past_key_values, sequences } = await model.generate({
+    ...inputs,
+    // TODO: Add back when fixed
+    // past_key_values: past_key_values_cache,
+
+    // Sampling
+    do_sample: false,
+    repetition_penalty: 1.1,
+    // top_k: 3,
+    // temperature: 0.2,
+
+    max_new_tokens: 2048,
+    streamer,
+    stopping_criteria,
+    return_dict_in_generate: true,
+  });
+  past_key_values_cache = past_key_values;
+
+  const decoded = tokenizer.batch_decode(sequences, {
+    skip_special_tokens: true,
+  });
+
+  // Send the output back to the main thread
+  self.postMessage({
+    status: "complete",
+    output: decoded,
+  });
+}
+
+async function load() {
+  self.postMessage({
+    status: "loading",
+    data: "Loading model...",
+  });
+
+  // Load the pipeline and save it for future use.
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  self.postMessage({
+    status: "loading",
+    data: "Compiling shaders and warming up model...",
+  });
+
+  // Run model with dummy input to compile shaders
+  const inputs = tokenizer("a");
+  await model.generate({ ...inputs, max_new_tokens: 1 });
+  self.postMessage({ status: "ready" });
+}
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case "check":
+      check();
+      break;
+
+    case "load":
+      load();
+      break;
+
+    case "generate":
+      stopping_criteria.reset();
+      generate(data);
+      break;
+
+    case "interrupt":
+      stopping_criteria.interrupt();
+      break;
+
+    case "reset":
+      past_key_values_cache = null;
+      stopping_criteria.reset();
+      break;
+  }
+});
+
+
+----- .\llama-3.2-webgpu\src\worker.js -----
+
+import {
+  AutoTokenizer,
+  AutoModelForCausalLM,
+  TextStreamer,
+  InterruptableStoppingCriteria,
+} from "@huggingface/transformers";
+
+/**
+ * This class uses the Singleton pattern to enable lazy-loading of the pipeline
+ */
+class TextGenerationPipeline {
+  static model_id = "onnx-community/Llama-3.2-1B-Instruct-q4f16";
+
+  static async getInstance(progress_callback = null) {
+    this.tokenizer ??= AutoTokenizer.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+
+    this.model ??= AutoModelForCausalLM.from_pretrained(this.model_id, {
+      dtype: "q4f16",
+      device: "webgpu",
+      progress_callback,
+    });
+
+    return Promise.all([this.tokenizer, this.model]);
+  }
+}
+
+const stopping_criteria = new InterruptableStoppingCriteria();
+
+let past_key_values_cache = null;
+async function generate(messages) {
+  // Retrieve the text-generation pipeline.
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance();
+
+  const inputs = tokenizer.apply_chat_template(messages, {
+    add_generation_prompt: true,
+    return_dict: true,
+  });
+
+  let startTime;
+  let numTokens = 0;
+  let tps;
+  const token_callback_function = () => {
+    startTime ??= performance.now();
+
+    if (numTokens++ > 0) {
+      tps = (numTokens / (performance.now() - startTime)) * 1000;
+    }
+  };
+  const callback_function = (output) => {
+    self.postMessage({
+      status: "update",
+      output,
+      tps,
+      numTokens,
+    });
+  };
+
+  const streamer = new TextStreamer(tokenizer, {
+    skip_prompt: true,
+    skip_special_tokens: true,
+    callback_function,
+    token_callback_function,
+  });
+
+  // Tell the main thread we are starting
+  self.postMessage({ status: "start" });
+
+  const { past_key_values, sequences } = await model.generate({
+    ...inputs,
+    // TODO: Add when model is fixed
+    // past_key_values: past_key_values_cache,
+
+    // Sampling
+    do_sample: false,
+
+    max_new_tokens: 1024,
+    streamer,
+    stopping_criteria,
+    return_dict_in_generate: true,
+  });
+  // past_key_values_cache = past_key_values;
+
+  const decoded = tokenizer.batch_decode(sequences, {
+    skip_special_tokens: true,
+  });
+
+  // Send the output back to the main thread
+  self.postMessage({
+    status: "complete",
+    output: decoded,
+  });
+}
+
+async function check() {
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error("WebGPU is not supported (no adapter found)");
+    }
+  } catch (e) {
+    self.postMessage({
+      status: "error",
+      data: e.toString(),
+    });
+  }
+}
+
+async function load() {
+  self.postMessage({
+    status: "loading",
+    data: "Loading model...",
+  });
+
+  // Load the pipeline and save it for future use.
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  self.postMessage({
+    status: "loading",
+    data: "Compiling shaders and warming up model...",
+  });
+
+  // Run model with dummy input to compile shaders
+  const inputs = tokenizer("a");
+  await model.generate({ ...inputs, max_new_tokens: 1 });
+  self.postMessage({ status: "ready" });
+}
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case "check":
+      check();
+      break;
+
+    case "load":
+      load();
+      break;
+
+    case "generate":
+      stopping_criteria.reset();
+      generate(data);
+      break;
+
+    case "interrupt":
+      stopping_criteria.interrupt();
+      break;
+
+    case "reset":
+      // past_key_values_cache = null;
+      stopping_criteria.reset();
+      break;
+  }
+});
+
+
+----- .\moonshine-web\src\worker.js -----
+
+import { AutoModel, Tensor, pipeline } from "@huggingface/transformers";
+import {
+  MAX_BUFFER_DURATION,
+  SAMPLE_RATE,
+  SPEECH_THRESHOLD,
+  EXIT_THRESHOLD,
+  SPEECH_PAD_SAMPLES,
+  MAX_NUM_PREV_BUFFERS,
+  MIN_SILENCE_DURATION_SAMPLES,
+  MIN_SPEECH_DURATION_SAMPLES,
+} from "./constants";
+import { supportsWebGPU } from "./utils";
+
+const device = (await supportsWebGPU()) ? "webgpu" : "wasm";
+self.postMessage({ type: "info", message: `Using device: "${device}"` });
+self.postMessage({
+  type: "info",
+  message: "Loading models...",
+  duration: "until_next",
+});
+
+// Load models
+const silero_vad = await AutoModel.from_pretrained(
+  "onnx-community/silero-vad",
+  {
+    config: { model_type: "custom" },
+    dtype: "fp32", // Full-precision
+  },
+).catch((error) => {
+  self.postMessage({ error });
+  throw error;
+});
+
+const DEVICE_DTYPE_CONFIGS = {
+  webgpu: {
+    encoder_model: "fp32",
+    decoder_model_merged: "q4",
+  },
+  wasm: {
+    encoder_model: "fp32",
+    decoder_model_merged: "q8",
+  },
+};
+const transcriber = await pipeline(
+  "automatic-speech-recognition",
+  "onnx-community/moonshine-base-ONNX", // or "onnx-community/whisper-tiny.en",
+  {
+    device,
+    dtype: DEVICE_DTYPE_CONFIGS[device],
+  },
+).catch((error) => {
+  self.postMessage({ error });
+  throw error;
+});
+
+await transcriber(new Float32Array(SAMPLE_RATE)); // Compile shaders
+self.postMessage({ type: "status", status: "ready", message: "Ready!" });
+
+// Transformers.js currently doesn't support simultaneous inference,
+// so we need to chain the inference promises.
+let inferenceChain = Promise.resolve();
+
+// Global audio buffer to store incoming audio
+const BUFFER = new Float32Array(MAX_BUFFER_DURATION * SAMPLE_RATE);
+let bufferPointer = 0;
+
+// Initial state for VAD
+const sr = new Tensor("int64", [SAMPLE_RATE], []);
+let state = new Tensor("float32", new Float32Array(2 * 1 * 128), [2, 1, 128]);
+
+// Whether we are in the process of adding audio to the buffer
+let isRecording = false;
+
+/**
+ * Perform Voice Activity Detection (VAD)
+ * @param {Float32Array} buffer The new audio buffer
+ * @returns {Promise<boolean>} `true` if the buffer is speech, `false` otherwise.
+ */
+async function vad(buffer) {
+  const input = new Tensor("float32", buffer, [1, buffer.length]);
+
+  const { stateN, output } = await (inferenceChain = inferenceChain.then((_) =>
+    silero_vad({ input, sr, state }),
+  ));
+  state = stateN; // Update state
+
+  const isSpeech = output.data[0];
+
+  // Use heuristics to determine if the buffer is speech or not
+  return (
+    // Case 1: We are above the threshold (definitely speech)
+    isSpeech > SPEECH_THRESHOLD ||
+    // Case 2: We are in the process of recording, and the probability is above the negative (exit) threshold
+    (isRecording && isSpeech >= EXIT_THRESHOLD)
+  );
+}
+
+/**
+ * Transcribe the audio buffer
+ * @param {Float32Array} buffer The audio buffer
+ * @param {Object} data Additional data
+ */
+const transcribe = async (buffer, data) => {
+  const { text } = await (inferenceChain = inferenceChain.then((_) =>
+    transcriber(buffer),
+  ));
+  self.postMessage({ type: "output", buffer, message: text, ...data });
+};
+
+// Track the number of samples after the last speech chunk
+let postSpeechSamples = 0;
+const reset = (offset = 0) => {
+  self.postMessage({
+    type: "status",
+    status: "recording_end",
+    message: "Transcribing...",
+    duration: "until_next",
+  });
+  BUFFER.fill(0, offset);
+  bufferPointer = offset;
+  isRecording = false;
+  postSpeechSamples = 0;
+};
+
+const dispatchForTranscriptionAndResetAudioBuffer = (overflow) => {
+  // Get start and end time of the speech segment, minus the padding
+  const now = Date.now();
+  const end =
+    now - ((postSpeechSamples + SPEECH_PAD_SAMPLES) / SAMPLE_RATE) * 1000;
+  const start = end - (bufferPointer / SAMPLE_RATE) * 1000;
+  const duration = end - start;
+  const overflowLength = overflow?.length ?? 0;
+
+  // Send the audio buffer to the worker
+  const buffer = BUFFER.slice(0, bufferPointer + SPEECH_PAD_SAMPLES);
+
+  const prevLength = prevBuffers.reduce((acc, b) => acc + b.length, 0);
+  const paddedBuffer = new Float32Array(prevLength + buffer.length);
+  let offset = 0;
+  for (const prev of prevBuffers) {
+    paddedBuffer.set(prev, offset);
+    offset += prev.length;
+  }
+  paddedBuffer.set(buffer, offset);
+  transcribe(paddedBuffer, { start, end, duration });
+
+  // Set overflow (if present) and reset the rest of the audio buffer
+  if (overflow) {
+    BUFFER.set(overflow, 0);
+  }
+  reset(overflowLength);
+};
+
+let prevBuffers = [];
+self.onmessage = async (event) => {
+  const { buffer } = event.data;
+
+  const wasRecording = isRecording; // Save current state
+  const isSpeech = await vad(buffer);
+
+  if (!wasRecording && !isSpeech) {
+    // We are not recording, and the buffer is not speech,
+    // so we will probably discard the buffer. So, we insert
+    // into a FIFO queue with maximum size of PREV_BUFFER_SIZE
+    if (prevBuffers.length >= MAX_NUM_PREV_BUFFERS) {
+      // If the queue is full, we discard the oldest buffer
+      prevBuffers.shift();
+    }
+    prevBuffers.push(buffer);
+    return;
+  }
+
+  const remaining = BUFFER.length - bufferPointer;
+  if (buffer.length >= remaining) {
+    // The buffer is larger than (or equal to) the remaining space in the global buffer,
+    // so we perform transcription and copy the overflow to the global buffer
+    BUFFER.set(buffer.subarray(0, remaining), bufferPointer);
+    bufferPointer += remaining;
+
+    // Dispatch the audio buffer
+    const overflow = buffer.subarray(remaining);
+    dispatchForTranscriptionAndResetAudioBuffer(overflow);
+    return;
+  } else {
+    // The buffer is smaller than the remaining space in the global buffer,
+    // so we copy it to the global buffer
+    BUFFER.set(buffer, bufferPointer);
+    bufferPointer += buffer.length;
+  }
+
+  if (isSpeech) {
+    if (!isRecording) {
+      // Indicate start of recording
+      self.postMessage({
+        type: "status",
+        status: "recording_start",
+        message: "Listening...",
+        duration: "until_next",
+      });
+    }
+    // Start or continue recording
+    isRecording = true;
+    postSpeechSamples = 0; // Reset the post-speech samples
+    return;
+  }
+
+  postSpeechSamples += buffer.length;
+
+  // At this point we're confident that we were recording (wasRecording === true), but the latest buffer is not speech.
+  // So, we check whether we have reached the end of the current audio chunk.
+  if (postSpeechSamples < MIN_SILENCE_DURATION_SAMPLES) {
+    // There was a short pause, but not long enough to consider the end of a speech chunk
+    // (e.g., the speaker took a breath), so we continue recording
+    return;
+  }
+
+  if (bufferPointer < MIN_SPEECH_DURATION_SAMPLES) {
+    // The entire buffer (including the new chunk) is smaller than the minimum
+    // duration of a speech chunk, so we can safely discard the buffer.
+    reset();
+    return;
+  }
+
+  dispatchForTranscriptionAndResetAudioBuffer();
+};
+
+
+----- .\pglite-semantic-search\src\worker.js -----
+
+import { pipeline } from "@huggingface/transformers";
+
+// Use the Singleton pattern to enable lazy construction of the pipeline.
+class PipelineSingleton {
+  static task = "feature-extraction";
+  static model = "Supabase/gte-small";
+  static instance = null;
+
+  static async getInstance(progress_callback = null) {
+    if (this.instance === null) {
+      this.instance = pipeline(this.task, this.model, {
+        progress_callback,
+        dtype: "fp32",
+        device: !!navigator.gpu ? "webgpu" : "wasm",
+      });
+    }
+    return this.instance;
+  }
+}
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (event) => {
+  // Retrieve the classification pipeline. When called for the first time,
+  // this will load the pipeline and save it for future use.
+  const classifier = await PipelineSingleton.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  // Actually perform the classification
+  const output = await classifier(event.data.text, {
+    pooling: "mean",
+    normalize: true,
+  });
+
+  // Extract the embedding output
+  const embedding = Array.from(output.data);
+
+  // Send the output back to the main thread
+  self.postMessage({
+    status: "complete",
+    embedding,
+  });
+});
+
+
+----- .\phi-3.5-webgpu\src\worker.js -----
+
+import {
+  AutoTokenizer,
+  AutoModelForCausalLM,
+  TextStreamer,
+  InterruptableStoppingCriteria,
+} from "@huggingface/transformers";
+
+/**
+ * This class uses the Singleton pattern to enable lazy-loading of the pipeline
+ */
+class TextGenerationPipeline {
+  static model_id = "onnx-community/Phi-3.5-mini-instruct-onnx-web";
+
+  static async getInstance(progress_callback = null) {
+    this.tokenizer ??= AutoTokenizer.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+
+    this.model ??= AutoModelForCausalLM.from_pretrained(this.model_id, {
+      // dtype: "q4",
+      dtype: "q4f16",
+      device: "webgpu",
+      use_external_data_format: true,
+      progress_callback,
+    });
+
+    return Promise.all([this.tokenizer, this.model]);
+  }
+}
+
+const stopping_criteria = new InterruptableStoppingCriteria();
+
+let past_key_values_cache = null;
+async function generate(messages) {
+  // Retrieve the text-generation pipeline.
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance();
+
+  const inputs = tokenizer.apply_chat_template(messages, {
+    add_generation_prompt: true,
+    return_dict: true,
+  });
+
+  let startTime;
+  let numTokens = 0;
+  let tps;
+  const token_callback_function = () => {
+    startTime ??= performance.now();
+
+    if (numTokens++ > 0) {
+      tps = (numTokens / (performance.now() - startTime)) * 1000;
+    }
+  };
+  const callback_function = (output) => {
+    self.postMessage({
+      status: "update",
+      output,
+      tps,
+      numTokens,
+    });
+  };
+
+  const streamer = new TextStreamer(tokenizer, {
+    skip_prompt: true,
+    skip_special_tokens: true,
+    callback_function,
+    token_callback_function,
+  });
+
+  // Tell the main thread we are starting
+  self.postMessage({ status: "start" });
+
+  const { past_key_values, sequences } = await model.generate({
+    ...inputs,
+    // TODO: Enable once model is fixed
+    // past_key_values: past_key_values_cache,
+
+    // Sampling
+    do_sample: true,
+    top_k: 3,
+    temperature: 0.2,
+
+    max_new_tokens: 1024,
+    streamer,
+    stopping_criteria,
+    return_dict_in_generate: true,
+  });
+  past_key_values_cache = past_key_values;
+
+  const decoded = tokenizer.batch_decode(sequences, {
+    skip_special_tokens: true,
+  });
+
+  // Send the output back to the main thread
+  self.postMessage({
+    status: "complete",
+    output: decoded,
+  });
+}
+
+async function check() {
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error("WebGPU is not supported (no adapter found)");
+    }
+  } catch (e) {
+    self.postMessage({
+      status: "error",
+      data: e.toString(),
+    });
+  }
+}
+
+async function load() {
+  self.postMessage({
+    status: "loading",
+    data: "Loading model...",
+  });
+
+  // Load the pipeline and save it for future use.
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  self.postMessage({
+    status: "loading",
+    data: "Compiling shaders and warming up model...",
+  });
+
+  // Run model with dummy input to compile shaders
+  const inputs = tokenizer("a");
+  await model.generate({ ...inputs, max_new_tokens: 1 });
+  self.postMessage({ status: "ready" });
+}
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case "check":
+      check();
+      break;
+
+    case "load":
+      load();
+      break;
+
+    case "generate":
+      stopping_criteria.reset();
+      generate(data);
+      break;
+
+    case "interrupt":
+      stopping_criteria.interrupt();
+      break;
+
+    case "reset":
+      past_key_values_cache = null;
+      stopping_criteria.reset();
+      break;
+  }
+});
+
+
+----- .\realtime-whisper-webgpu\src\worker.js -----
+
+import {
+  AutoTokenizer,
+  AutoProcessor,
+  WhisperForConditionalGeneration,
+  TextStreamer,
+  full,
+} from "@huggingface/transformers";
+
+const MAX_NEW_TOKENS = 64;
+
+/**
+ * This class uses the Singleton pattern to ensure that only one instance of the model is loaded.
+ */
+class AutomaticSpeechRecognitionPipeline {
+  static model_id = "onnx-community/whisper-base";
+  static tokenizer = null;
+  static processor = null;
+  static model = null;
+
+  static async getInstance(progress_callback = null) {
+    this.tokenizer ??= AutoTokenizer.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+    this.processor ??= AutoProcessor.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+
+    this.model ??= WhisperForConditionalGeneration.from_pretrained(
+      this.model_id,
+      {
+        dtype: {
+          encoder_model: "fp32", // 'fp16' works too
+          decoder_model_merged: "q4", // or 'fp32' ('fp16' is broken)
+        },
+        device: "webgpu",
+        progress_callback,
+      },
+    );
+
+    return Promise.all([this.tokenizer, this.processor, this.model]);
+  }
+}
+
+let processing = false;
+async function generate({ audio, language }) {
+  if (processing) return;
+  processing = true;
+
+  // Tell the main thread we are starting
+  self.postMessage({ status: "start" });
+
+  // Retrieve the text-generation pipeline.
+  const [tokenizer, processor, model] =
+    await AutomaticSpeechRecognitionPipeline.getInstance();
+
+  let startTime;
+  let numTokens = 0;
+  let tps;
+  const token_callback_function = () => {
+    startTime ??= performance.now();
+
+    if (numTokens++ > 0) {
+      tps = (numTokens / (performance.now() - startTime)) * 1000;
+    }
+  };
+  const callback_function = (output) => {
+    self.postMessage({
+      status: "update",
+      output,
+      tps,
+      numTokens,
+    });
+  };
+
+  const streamer = new TextStreamer(tokenizer, {
+    skip_prompt: true,
+    skip_special_tokens: true,
+    callback_function,
+    token_callback_function,
+  });
+
+  const inputs = await processor(audio);
+
+  const outputs = await model.generate({
+    ...inputs,
+    max_new_tokens: MAX_NEW_TOKENS,
+    language,
+    streamer,
+  });
+
+  const decoded = tokenizer.batch_decode(outputs, {
+    skip_special_tokens: true,
+  });
+
+  // Send the output back to the main thread
+  self.postMessage({
+    status: "complete",
+    output: decoded,
+  });
+  processing = false;
+}
+
+async function load() {
+  self.postMessage({
+    status: "loading",
+    data: "Loading model...",
+  });
+
+  // Load the pipeline and save it for future use.
+  const [tokenizer, processor, model] =
+    await AutomaticSpeechRecognitionPipeline.getInstance((x) => {
+      // We also add a progress callback to the pipeline so that we can
+      // track model loading.
+      self.postMessage(x);
+    });
+
+  self.postMessage({
+    status: "loading",
+    data: "Compiling shaders and warming up model...",
+  });
+
+  // Run model with dummy input to compile shaders
+  await model.generate({
+    input_features: full([1, 80, 3000], 0.0),
+    max_new_tokens: 1,
+  });
+  self.postMessage({ status: "ready" });
+}
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case "load":
+      load();
+      break;
+
+    case "generate":
+      generate(data);
+      break;
+  }
+});
+
+
+----- .\semantic-image-search-web\src\worker.js -----
+
+import {
+  AutoTokenizer,
+  CLIPTextModelWithProjection,
+  cos_sim,
+} from "@huggingface/transformers";
+import { getCachedFile, getCachedJSON } from "./utils.js";
+
+const EMBED_DIM = 512;
+
+class ApplicationSingleton {
+  static model_id = "Xenova/clip-vit-base-patch16";
+  static BASE_URL =
+    "https://huggingface.co/datasets/Xenova/semantic-image-search-assets/resolve/main/";
+
+  static tokenizer = null;
+  static text_model = null;
+  static metadata = null;
+  static embeddings = null;
+
+  static async getInstance(progress_callback = null) {
+    // Load tokenizer and text model
+    this.tokenizer ??= AutoTokenizer.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+    this.text_model ??= CLIPTextModelWithProjection.from_pretrained(
+      this.model_id,
+      { progress_callback },
+    );
+    this.metadata ??= getCachedJSON(this.BASE_URL + "image-embeddings.json");
+    this.embeddings ??= new Promise((resolve, reject) => {
+      getCachedFile(this.BASE_URL + "image-embeddings_25k-512-32bit.bin")
+        .then((buffer) => {
+          resolve(new Float32Array(buffer));
+        })
+        .catch(reject);
+    });
+
+    return Promise.all([
+      this.tokenizer,
+      this.text_model,
+      this.metadata,
+      this.embeddings,
+    ]);
+  }
+}
+
+function cosineSimilarity(query_embeds, database_embeds) {
+  const numDB = database_embeds.length / EMBED_DIM;
+  const similarityScores = new Array(numDB);
+
+  for (let i = 0; i < numDB; ++i) {
+    const startOffset = i * EMBED_DIM;
+    const dbVector = database_embeds.slice(
+      startOffset,
+      startOffset + EMBED_DIM,
+    );
+
+    similarityScores[i] = cos_sim(query_embeds, dbVector);
+  }
+
+  return similarityScores;
+}
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (event) => {
+  // Get the tokenizer, model, metadata, and embeddings. When called for the first time,
+  // this will load the files and cache them for future use.
+  const [tokenizer, text_model, metadata, embeddings] =
+    await ApplicationSingleton.getInstance(self.postMessage);
+
+  // Send the output back to the main thread
+  self.postMessage({ status: "ready" });
+
+  // Run tokenization
+  const text_inputs = tokenizer(event.data.text, {
+    padding: true,
+    truncation: true,
+  });
+
+  // Compute embeddings
+  const { text_embeds } = await text_model(text_inputs);
+
+  // Compute similarity scores
+  const scores = cosineSimilarity(text_embeds.data, embeddings);
+
+  // Make a copy of the metadata
+  let output = metadata.slice(0);
+
+  // Add scores to output
+  for (let i = 0; i < metadata.length; ++i) {
+    output[i].score = scores[i];
+  }
+
+  // Sort by score
+  output.sort((a, b) => b.score - a.score);
+
+  // Get top 100 results
+  output = output.slice(0, 100);
+
+  // Send the output back to the main thread
+  self.postMessage({
+    status: "complete",
+    output: output,
+  });
+});
+
+
+----- .\smollm-webgpu\src\worker.js -----
+
+import {
+  AutoTokenizer,
+  AutoModelForCausalLM,
+  TextStreamer,
+  InterruptableStoppingCriteria,
+} from "@huggingface/transformers";
+
+/**
+ * Helper function to perform feature detection for WebGPU
+ */
+// let fp16_supported = false;
+async function check() {
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error("WebGPU is not supported (no adapter found)");
+    }
+    // fp16_supported = adapter.features.has("shader-f16")
+  } catch (e) {
+    self.postMessage({
+      status: "error",
+      data: e.toString(),
+    });
+  }
+}
+
+/**
+ * This class uses the Singleton pattern to enable lazy-loading of the pipeline
+ */
+class TextGenerationPipeline {
+  static model_id = "HuggingFaceTB/SmolLM2-1.7B-Instruct";
+
+  static async getInstance(progress_callback = null) {
+    this.tokenizer ??= AutoTokenizer.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+
+    this.model ??= AutoModelForCausalLM.from_pretrained(this.model_id, {
+      dtype: "q4f16", // TODO: use "q4" as fallback when fixed
+      device: "webgpu",
+      progress_callback,
+    });
+
+    return Promise.all([this.tokenizer, this.model]);
+  }
+}
+
+const stopping_criteria = new InterruptableStoppingCriteria();
+
+let past_key_values_cache = null;
+async function generate(messages) {
+  // Retrieve the text-generation pipeline.
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance();
+
+  const inputs = tokenizer.apply_chat_template(messages, {
+    add_generation_prompt: true,
+    return_dict: true,
+  });
+
+  let startTime;
+  let numTokens = 0;
+  let tps;
+  const token_callback_function = () => {
+    startTime ??= performance.now();
+
+    if (numTokens++ > 0) {
+      tps = (numTokens / (performance.now() - startTime)) * 1000;
+    }
+  };
+  const callback_function = (output) => {
+    self.postMessage({
+      status: "update",
+      output,
+      tps,
+      numTokens,
+    });
+  };
+
+  const streamer = new TextStreamer(tokenizer, {
+    skip_prompt: true,
+    skip_special_tokens: true,
+    callback_function,
+    token_callback_function,
+  });
+
+  // Tell the main thread we are starting
+  self.postMessage({ status: "start" });
+
+  const { past_key_values, sequences } = await model.generate({
+    ...inputs,
+    // TODO: Add back when fixed
+    // past_key_values: past_key_values_cache,
+
+    // Sampling
+    // do_sample: true,
+    // top_k: 3,
+    // temperature: 0.2,
+
+    max_new_tokens: 1024,
+    streamer,
+    stopping_criteria,
+    return_dict_in_generate: true,
+  });
+  past_key_values_cache = past_key_values;
+
+  const decoded = tokenizer.batch_decode(sequences, {
+    skip_special_tokens: true,
+  });
+
+  // Send the output back to the main thread
+  self.postMessage({
+    status: "complete",
+    output: decoded,
+  });
+}
+
+async function load() {
+  self.postMessage({
+    status: "loading",
+    data: "Loading model...",
+  });
+
+  // Load the pipeline and save it for future use.
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  self.postMessage({
+    status: "loading",
+    data: "Compiling shaders and warming up model...",
+  });
+
+  // Run model with dummy input to compile shaders
+  const inputs = tokenizer("a");
+  await model.generate({ ...inputs, max_new_tokens: 1 });
+  self.postMessage({ status: "ready" });
+}
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case "check":
+      check();
+      break;
+
+    case "load":
+      load();
+      break;
+
+    case "generate":
+      stopping_criteria.reset();
+      generate(data);
+      break;
+
+    case "interrupt":
+      stopping_criteria.interrupt();
+      break;
+
+    case "reset":
+      past_key_values_cache = null;
+      stopping_criteria.reset();
+      break;
+  }
+});
+
+
+----- .\smolvlm-webgpu\src\worker.js -----
+
+import {
+  AutoProcessor,
+  AutoModelForVision2Seq,
+  TextStreamer,
+  InterruptableStoppingCriteria,
+  load_image,
+} from "@huggingface/transformers";
+
+const MAX_NEW_TOKENS = 1024;
+
+/**
+ * Helper function to perform feature detection for WebGPU
+ */
+let fp16_supported = false;
+async function check() {
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error("WebGPU is not supported (no adapter found)");
+    }
+    fp16_supported = adapter.features.has("shader-f16");
+  } catch (e) {
+    self.postMessage({
+      status: "error",
+      data: e.toString(),
+    });
+  }
+}
+
+/**
+ * This class uses the Singleton pattern to enable lazy-loading of the pipeline
+ */
+class SmolVLM {
+  static model_id = "HuggingFaceTB/SmolVLM-256M-Instruct";
+
+  static async getInstance(progress_callback = null) {
+    this.processor ??= AutoProcessor.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+
+    this.model ??= AutoModelForVision2Seq.from_pretrained(this.model_id, {
+      dtype: "fp32",
+      device: "webgpu",
+      progress_callback,
+    });
+
+    return Promise.all([this.processor, this.model]);
+  }
+}
+
+const stopping_criteria = new InterruptableStoppingCriteria();
+
+let past_key_values_cache = null;
+async function generate(messages) {
+  // For this demo, we only respond to the last message
+  messages = messages.slice(-1);
+
+  // Retrieve the text-generation pipeline.
+  const [processor, model] = await SmolVLM.getInstance();
+
+  // Load all images
+  const images = await Promise.all(
+    messages
+      .map((x) => x.content)
+      .flat(Infinity)
+      .filter((msg) => msg.image !== undefined)
+      .map((msg) => load_image(msg.image)),
+  );
+
+  // Prepare inputs
+  const text = processor.apply_chat_template(messages, {
+    add_generation_prompt: true,
+  });
+  const inputs = await processor(text, images, {
+    // Set `do_image_splitting: true` to split images into multiple patches.
+    // NOTE: This uses more memory, but can provide more accurate results.
+    // do_image_splitting: false,
+  });
+
+  let startTime;
+  let numTokens = 0;
+  let tps;
+  const token_callback_function = (tokens) => {
+    startTime ??= performance.now();
+
+    if (numTokens++ > 0) {
+      tps = (numTokens / (performance.now() - startTime)) * 1000;
+    }
+  };
+  const callback_function = (output) => {
+    self.postMessage({
+      status: "update",
+      output,
+      tps,
+      numTokens,
+    });
+  };
+
+  const streamer = new TextStreamer(processor.tokenizer, {
+    skip_prompt: true,
+    skip_special_tokens: true,
+    callback_function,
+    token_callback_function,
+  });
+
+  // Tell the main thread we are starting
+  self.postMessage({ status: "start" });
+
+  const { past_key_values, sequences } = await model
+    .generate({
+      ...inputs,
+      // TODO: Add back when fixed
+      // past_key_values: past_key_values_cache,
+
+      // Sampling
+      do_sample: false,
+      repetition_penalty: 1.1,
+      // top_k: 3,
+      // temperature: 0.2,
+
+      max_new_tokens: MAX_NEW_TOKENS,
+      streamer,
+      stopping_criteria,
+      return_dict_in_generate: true,
+    })
+    .catch((e) => {
+      self.postMessage({
+        status: "error",
+        data: e.toString(),
+      });
+    });
+  past_key_values_cache = past_key_values;
+
+  const decoded = processor.batch_decode(sequences, {
+    skip_special_tokens: true,
+  });
+
+  // Send the output back to the main thread
+  self.postMessage({
+    status: "complete",
+    output: decoded,
+  });
+}
+
+async function load() {
+  self.postMessage({
+    status: "loading",
+    data: "Loading model...",
+  });
+
+  // Load the pipeline and save it for future use.
+  const [processor, model] = await SmolVLM.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  self.postMessage({ status: "ready" });
+}
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case "check":
+      check();
+      break;
+
+    case "load":
+      load();
+      break;
+
+    case "generate":
+      stopping_criteria.reset();
+      generate(data);
+      break;
+
+    case "interrupt":
+      stopping_criteria.interrupt();
+      break;
+
+    case "reset":
+      past_key_values_cache = null;
+      stopping_criteria.reset();
+      break;
+  }
+});
+
+
+----- .\speecht5-web\src\worker.js -----
+
+import {
+  Tensor,
+  AutoTokenizer,
+  SpeechT5ForTextToSpeech,
+  SpeechT5HifiGan,
+} from "@huggingface/transformers";
+import { encodeWAV } from "./utils";
+
+// Use the Singleton pattern to enable lazy construction of the pipeline.
+class MyTextToSpeechPipeline {
+  static BASE_URL =
+    "https://huggingface.co/datasets/Xenova/cmu-arctic-xvectors-extracted/resolve/main/";
+
+  static model_id = "Xenova/speecht5_tts";
+  static vocoder_id = "Xenova/speecht5_hifigan";
+
+  static tokenizer_instance = null;
+  static model_instance = null;
+  static vocoder_instance = null;
+
+  static async getInstance(progress_callback = null) {
+    this.tokenizer_instance ??= AutoTokenizer.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+
+    this.model_instance ??= SpeechT5ForTextToSpeech.from_pretrained(
+      this.model_id,
+      {
+        dtype: "fp32",
+        progress_callback,
+      },
+    );
+
+    this.vocoder_instance ??= SpeechT5HifiGan.from_pretrained(this.vocoder_id, {
+      dtype: "fp32",
+      progress_callback,
+    });
+
+    return new Promise(async (resolve, reject) => {
+      const result = await Promise.all([
+        this.tokenizer_instance,
+        this.model_instance,
+        this.vocoder_instance,
+      ]);
+      self.postMessage({
+        status: "ready",
+      });
+      resolve(result);
+    });
+  }
+
+  static async getSpeakerEmbeddings(speaker_id) {
+    // e.g., `cmu_us_awb_arctic-wav-arctic_a0001`
+    const speaker_embeddings_url = `${this.BASE_URL}${speaker_id}.bin`;
+    const speaker_embeddings = new Tensor(
+      "float32",
+      new Float32Array(
+        await (await fetch(speaker_embeddings_url)).arrayBuffer(),
+      ),
+      [1, 512],
+    );
+    return speaker_embeddings;
+  }
+}
+
+// Mapping of cached speaker embeddings
+const speaker_embeddings_cache = new Map();
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (event) => {
+  // Load the pipeline
+  const [tokenizer, model, vocoder] = await MyTextToSpeechPipeline.getInstance(
+    (x) => {
+      // We also add a progress callback so that we can track model loading.
+      self.postMessage(x);
+    },
+  );
+
+  // Tokenize the input
+  const { input_ids } = tokenizer(event.data.text);
+
+  // Load the speaker embeddings
+  let speaker_embeddings = speaker_embeddings_cache.get(event.data.speaker_id);
+  if (speaker_embeddings === undefined) {
+    speaker_embeddings = await MyTextToSpeechPipeline.getSpeakerEmbeddings(
+      event.data.speaker_id,
+    );
+    speaker_embeddings_cache.set(event.data.speaker_id, speaker_embeddings);
+  }
+
+  // Generate the waveform
+  const { waveform } = await model.generate_speech(
+    input_ids,
+    speaker_embeddings,
+    { vocoder },
+  );
+
+  // Encode the waveform as a WAV file
+  const wav = encodeWAV(waveform.data);
+
+  // Send the output back to the main thread
+  self.postMessage({
+    status: "complete",
+    output: new Blob([wav], { type: "audio/wav" }),
+  });
+});
+
+
+----- .\text-to-speech-webgpu\src\worker.js -----
+
+import { HFModelConfig_v1, InterfaceHF } from "outetts";
+
+// Check if WebGPU is supported
+let fp16_supported = false;
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    throw new Error("WebGPU is not supported (no adapter found)");
+  }
+  fp16_supported = adapter.features.has("shader-f16");
+  self.postMessage({ status: "feature-success" });
+} catch (e) {
+  self.postMessage({
+    status: "feature-error",
+    data: e.toString(),
+  });
+  throw e;
+}
+
+// Configure the model
+const model_config = new HFModelConfig_v1({
+  model_path: "onnx-community/OuteTTS-0.2-500M",
+  language: "en", // Supported languages in v0.2: en, zh, ja, ko
+  dtype: fp16_supported ? "q4f16" : "q4", // Supported dtypes: fp32, fp16, q8, q4, q4f16
+  device: "webgpu", // Supported devices: webgpu, wasm
+});
+
+// Initialize the interface
+const tts_interface = await InterfaceHF({
+  model_version: "0.2",
+  cfg: model_config,
+});
+self.postMessage({ status: "ready" });
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { text, speaker_id } = e.data;
+
+  // Load a default speaker
+  const speaker =
+    speaker_id === "random"
+      ? null
+      : tts_interface.load_default_speaker(speaker_id);
+
+  // Generate speech
+  const output = await tts_interface.generate({
+    text,
+    temperature: 0.1, // Lower temperature values may result in a more stable tone
+    repetition_penalty: 1.1,
+    max_length: 4096,
+
+    // Optional: Use a speaker profile for consistent voice characteristics
+    // Without a speaker profile, the model will generate a voice with random characteristics
+    speaker,
+  });
+
+  // Send the audio file back to the main thread
+  const buffer = output.to_wav("output.wav");
+  const blob = new Blob([buffer], { type: "audio/wav" });
+  self.postMessage({
+    status: "complete",
+    audio: URL.createObjectURL(blob),
+    text,
+  });
+});
+
+
+----- .\the-tokenizer-playground\src\worker.js -----
+
+// Although not strictly necessary, we delegate the tokenization to a worker thread to avoid
+// any potential issues with the tokenizer blocking the main thread (especially for large inputs).
+
+import { AutoTokenizer } from "@huggingface/transformers";
+
+// This is a map of all the tokenizer instances that we have loaded.
+// model_id -> promise that resolves to tokenizer
+const TOKENIZER_MAPPINGS = new Map();
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (event) => {
+  const { model_id, text } = event.data;
+
+  // Only load the tokenizer if it hasn't been loaded yet
+  let tokenizerPromise = TOKENIZER_MAPPINGS.get(model_id);
+  if (!tokenizerPromise) {
+    // For visualization purposes, we may need to modify the tokenizer slightly
+    tokenizerPromise = AutoTokenizer.from_pretrained(model_id).then(
+      (tokenizer) => {
+        // NOTE: We just remove the StripDecoder from the llama tokenizer
+        const tokenizer_class = (
+          tokenizer._tokenizer_config?.tokenizer_class ?? ""
+        ).replace(/Fast$/, "");
+        switch (tokenizer_class) {
+          case "LlamaTokenizer":
+          case "Grok1Tokenizer":
+            // tokenizer.decoder.decoders.at(-1).constructor.name === 'StripDecoder'
+            tokenizer.decoder.decoders.pop();
+            break;
+          case "T5Tokenizer":
+            tokenizer.decoder.addPrefixSpace = false;
+            break;
+        }
+        return tokenizer;
+      },
+    );
+
+    TOKENIZER_MAPPINGS.set(model_id, tokenizerPromise);
+  }
+
+  const tokenizer = await tokenizerPromise;
+
+  // Tokenize the input text
+  const token_ids = tokenizer.encode(text);
+
+  // Decode the token IDs back to text
+  let decoded = token_ids.map((x) => tokenizer.decode([x]));
+
+  // Minor post-processing for visualization purposes
+  let margins = [];
+  switch (tokenizer.constructor.name) {
+    case "BertTokenizer":
+      margins = decoded.map((x, i) => (i === 0 || x.startsWith("##") ? 0 : 8));
+      decoded = decoded.map((x) => x.replace("##", ""));
+      break;
+    case "T5Tokenizer":
+      if (decoded.length > 0 && decoded !== " ") {
+        decoded[0] = decoded[0].replace(/^ /, "");
+      }
+      break;
+  }
+
+  // Send the output back to the main thread
+  self.postMessage({
+    token_ids,
+    decoded,
+    margins,
+  });
+});
+
+
+----- .\tinyswallow-webgpu\src\worker.js -----
+
+import {
+  AutoTokenizer,
+  AutoModelForCausalLM,
+  TextStreamer,
+  InterruptableStoppingCriteria,
+} from "@huggingface/transformers";
+
+/**
+ * Helper function to perform feature detection for WebGPU
+ */
+let fp16_supported = false;
+async function check() {
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error("WebGPU is not supported (no adapter found)");
+    }
+    fp16_supported = adapter.features.has("shader-f16");
+  } catch (e) {
+    self.postMessage({
+      status: "error",
+      data: e.toString(),
+    });
+  }
+}
+
+/**
+ * This class uses the Singleton pattern to enable lazy-loading of the pipeline
+ */
+class TextGenerationPipeline {
+  static model_id = "onnx-community/TinySwallow-1.5B-Instruct-ONNX";
+
+  static async getInstance(progress_callback = null) {
+    this.tokenizer ??= AutoTokenizer.from_pretrained(this.model_id, {
+      progress_callback,
+    });
+
+    this.model ??= AutoModelForCausalLM.from_pretrained(this.model_id, {
+      dtype: fp16_supported ? "q4f16" : "q4",
+      device: "webgpu",
+      progress_callback,
+      use_external_data_format: true,
+    });
+
+    return Promise.all([this.tokenizer, this.model]);
+  }
+}
+
+const stopping_criteria = new InterruptableStoppingCriteria();
+
+let past_key_values_cache = null;
+async function generate(messages) {
+  // Retrieve the text-generation pipeline.
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance();
+
+  const inputs = tokenizer.apply_chat_template(messages, {
+    add_generation_prompt: true,
+    return_dict: true,
+  });
+
+  let startTime;
+  let numTokens = 0;
+  let tps;
+  const token_callback_function = (tokens) => {
+    startTime ??= performance.now();
+
+    if (numTokens++ > 0) {
+      tps = (numTokens / (performance.now() - startTime)) * 1000;
+    }
+  };
+  const callback_function = (output) => {
+    self.postMessage({
+      status: "update",
+      output,
+      tps,
+      numTokens,
+    });
+  };
+
+  const streamer = new TextStreamer(tokenizer, {
+    skip_prompt: true,
+    skip_special_tokens: true,
+    callback_function,
+    token_callback_function,
+  });
+
+  // Tell the main thread we are starting
+  self.postMessage({ status: "start" });
+
+  const { past_key_values, sequences } = await model.generate({
+    ...inputs,
+    // TODO: Add back when fixed
+    // past_key_values: past_key_values_cache,
+
+    // Sampling
+    do_sample: false,
+    // repetition_penalty: 1.1,
+    // top_k: 3,
+    // temperature: 0.2,
+
+    max_new_tokens: 2048,
+    streamer,
+    stopping_criteria,
+    return_dict_in_generate: true,
+  });
+  past_key_values_cache = past_key_values;
+
+  const decoded = tokenizer.batch_decode(sequences, {
+    skip_special_tokens: true,
+  });
+
+  // Send the output back to the main thread
+  self.postMessage({
+    status: "complete",
+    output: decoded,
+  });
+}
+
+async function load() {
+  self.postMessage({
+    status: "loading",
+    data: "Loading model...",
+  });
+
+  // Load the pipeline and save it for future use.
+  const [tokenizer, model] = await TextGenerationPipeline.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  self.postMessage({
+    status: "loading",
+    data: "Compiling shaders and warming up model...",
+  });
+
+  // Run model with dummy input to compile shaders
+  const inputs = tokenizer("a");
+  await model.generate({ ...inputs, max_new_tokens: 1 });
+  self.postMessage({ status: "ready" });
+}
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case "check":
+      check();
+      break;
+
+    case "load":
+      load();
+      break;
+
+    case "generate":
+      stopping_criteria.reset();
+      generate(data);
+      break;
+
+    case "interrupt":
+      stopping_criteria.interrupt();
+      break;
+
+    case "reset":
+      past_key_values_cache = null;
+      stopping_criteria.reset();
+      break;
+  }
+});
+
+
+----- .\whisper-word-timestamps\src\worker.js -----
+
+import { pipeline } from "@huggingface/transformers";
+
+const PER_DEVICE_CONFIG = {
+  webgpu: {
+    dtype: {
+      encoder_model: "fp32",
+      decoder_model_merged: "q4",
+    },
+    device: "webgpu",
+  },
+  wasm: {
+    dtype: "q8",
+    device: "wasm",
+  },
+};
+
+/**
+ * This class uses the Singleton pattern to ensure that only one instance of the model is loaded.
+ */
+class PipelineSingeton {
+  static model_id = "onnx-community/whisper-base_timestamped";
+  static instance = null;
+
+  static async getInstance(progress_callback = null, device = "webgpu") {
+    if (!this.instance) {
+      this.instance = pipeline("automatic-speech-recognition", this.model_id, {
+        ...PER_DEVICE_CONFIG[device],
+        progress_callback,
+      });
+    }
+    return this.instance;
+  }
+}
+
+async function load({ device }) {
+  self.postMessage({
+    status: "loading",
+    data: `Loading model (${device})...`,
+  });
+
+  // Load the pipeline and save it for future use.
+  const transcriber = await PipelineSingeton.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  }, device);
+
+  if (device === "webgpu") {
+    self.postMessage({
+      status: "loading",
+      data: "Compiling shaders and warming up model...",
+    });
+
+    await transcriber(new Float32Array(16_000), {
+      language: "en",
+    });
+  }
+
+  self.postMessage({ status: "ready" });
+}
+
+async function run({ audio, language }) {
+  const transcriber = await PipelineSingeton.getInstance();
+
+  // Read and preprocess image
+  const start = performance.now();
+
+  const result = await transcriber(audio, {
+    language,
+    return_timestamps: "word",
+    chunk_length_s: 30,
+  });
+
+  const end = performance.now();
+
+  self.postMessage({ status: "complete", result, time: end - start });
+}
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (e) => {
+  const { type, data } = e.data;
+
+  switch (type) {
+    case "load":
+      load(data);
+      break;
+
+    case "run":
+      run(data);
+      break;
+  }
+});
+
+
+----- .\zero-shot-classification\src\worker.js -----
+
+import { pipeline } from "@huggingface/transformers";
+
+class MyZeroShotClassificationPipeline {
+  static task = "zero-shot-classification";
+  static model = "MoritzLaurer/deberta-v3-xsmall-zeroshot-v1.1-all-33";
+  static instance = null;
+
+  static async getInstance(progress_callback = null) {
+    this.instance ??= pipeline(this.task, this.model, {
+      progress_callback,
+    });
+
+    return this.instance;
+  }
+}
+
+// Listen for messages from the main thread
+self.addEventListener("message", async (event) => {
+  // Retrieve the pipeline. When called for the first time,
+  // this will load the pipeline and save it for future use.
+  const classifier = await MyZeroShotClassificationPipeline.getInstance((x) => {
+    // We also add a progress callback to the pipeline so that we can
+    // track model loading.
+    self.postMessage(x);
+  });
+
+  const { text, labels } = event.data;
+
+  const split = text.split("\n");
+  for (const line of split) {
+    const output = await classifier(line, labels, {
+      hypothesis_template: "This text is about {}.",
+      multi_label: true,
+    });
+    // Send the output back to the main thread
+    self.postMessage({ status: "output", output });
+  }
+  // Send the output back to the main thread
+  self.postMessage({ status: "complete" });
+});
+
+
